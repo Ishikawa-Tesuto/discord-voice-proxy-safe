@@ -120,7 +120,7 @@ BOOL CALLBACK InitNetworkProxy(PINIT_ONCE, PVOID, PVOID*) {
 
 // Export real DWrite ABI directly, instead of the original raw assembly JMP.
 extern "C" __declspec(dllexport)
-HRESULT WINAPI DWriteCreateFactory(DWRITE_FACTORY_TYPE type, REFIID iid, IUnknown** factory) {
+HRESULT WINAPI DWriteCreateFactory(DWRITE_FACTORY_TYPE type, REFIID iid, IUnknown** factory) WIN_NOEXCEPT {
     InitOnceExecuteOnce(&g_real_once, InitRealDWrite, nullptr, nullptr);
     if (!g_real_factory) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
     InitOnceExecuteOnce(&g_proxy_once, InitNetworkProxy, nullptr, nullptr);
