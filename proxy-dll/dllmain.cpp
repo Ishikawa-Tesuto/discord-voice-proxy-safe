@@ -53,6 +53,7 @@ void Log(const char* message, DWORD code = ERROR_SUCCESS) noexcept {
 }
 
 BOOL CALLBACK InitRealDWrite(PINIT_ONCE, PVOID, PVOID*) {
+    Log("DWriteCreateFactory reached: system factory initialization starting");
     g_real_dwrite = LoadLibraryExW(L"DWrite.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!g_real_dwrite) {
         Log("system DWrite.dll could not be loaded", GetLastError());
@@ -60,6 +61,7 @@ BOOL CALLBACK InitRealDWrite(PINIT_ONCE, PVOID, PVOID*) {
     }
     g_real_factory = reinterpret_cast<FactoryFn>(GetProcAddress(g_real_dwrite, "DWriteCreateFactory"));
     if (!g_real_factory) Log("DWriteCreateFactory export missing", GetLastError());
+    else Log("system DWriteCreateFactory resolved");
     return TRUE;
 }
 
@@ -77,6 +79,7 @@ bool AllowedSetting(const std::string& key) {
 }
 
 BOOL CALLBACK InitNetworkProxy(PINIT_ONCE, PVOID, PVOID*) {
+    Log("network initialization entered");
     try {
         const auto directory = SelfDirectory();
         if (directory.empty()) { Log("could not determine DLL directory"); return TRUE; }
@@ -103,12 +106,14 @@ BOOL CALLBACK InitNetworkProxy(PINIT_ONCE, PVOID, PVOID*) {
         // Never auto-load the legacy force-proxy.dll: its DllMain installs hooks.
         const fs::path dll = directory / L"force-proxy-safe.dll";
         if (!fs::exists(dll)) { Log("force-proxy-safe.dll missing: proxy disabled"); return TRUE; }
+        Log("loading force-proxy-safe.dll");
         g_network_proxy = LoadLibraryW(dll.c_str());
         if (!g_network_proxy) { Log("cannot load force-proxy-safe.dll", GetLastError()); return TRUE; }
 
         using StartFn = BOOL (WINAPI*)();
         const auto start = reinterpret_cast<StartFn>(GetProcAddress(g_network_proxy, "StartForceProxy"));
         if (!start) { Log("StartForceProxy export missing: proxy disabled", GetLastError()); return TRUE; }
+        Log("calling StartForceProxy");
         if (!start()) Log("StartForceProxy initialization returned false");
         else Log("StartForceProxy invoked; network hook status is not independently verified");
     } catch (...) {
@@ -123,8 +128,11 @@ extern "C" __declspec(dllexport)
 HRESULT WINAPI DWriteCreateFactory(DWRITE_FACTORY_TYPE type, REFIID iid, IUnknown** factory) WIN_NOEXCEPT {
     InitOnceExecuteOnce(&g_real_once, InitRealDWrite, nullptr, nullptr);
     if (!g_real_factory) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
-    InitOnceExecuteOnce(&g_proxy_once, InitNetworkProxy, nullptr, nullptr);
-    return g_real_factory(type, iid, factory);
+    // Initialize DirectWrite before installing network hooks.
+    const HRESULT hr = g_real_factory(type, iid, factory);
+    if (SUCCEEDED(hr)) InitOnceExecuteOnce(&g_proxy_once, InitNetworkProxy, nullptr, nullptr);
+    else Log("system DWriteCreateFactory failed", static_cast<DWORD>(hr));
+    return hr;
 }
 
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {

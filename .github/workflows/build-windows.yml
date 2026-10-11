@@ -38,6 +38,8 @@ jobs:
         run: |
           python tools/prepare_project.py
           if ($LASTEXITCODE -ne 0) { throw 'Loader project patch failed' }
+          python tools/configure_static_loader.py
+          if ($LASTEXITCODE -ne 0) { throw 'Static loader configuration failed' }
           python tools/patch_force_proxy.py _deps/force-proxy
           if ($LASTEXITCODE -ne 0) { throw 'Network source patch failed' }
 
@@ -77,6 +79,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'DWrite.dll validation failed' }
           python tools/verify_pe.py build/network/force-proxy.dll StartForceProxy
           if ($LASTEXITCODE -ne 0) { throw 'force-proxy.dll validation failed' }
+          python tools/check_imports.py build/loader/DWrite.dll
+          if ($LASTEXITCODE -ne 0) { throw 'Loader still depends on VC++ Redistributable' }
 
       - name: Install .NET SDK
         uses: actions/setup-dotnet@v4
