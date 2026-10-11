@@ -3,7 +3,7 @@
 // No networking, detours, file IO, or additional DLL loading in DllMain.
 
 #include <windows.h>
-#define DWRITE_EXPORT WINAPI
+#define DWRITE_EXPORT __declspec(dllexport) WINAPI
 #include <dwrite.h>  // Avoid dllimport while defining our DWriteCreateFactory export.
 #include <filesystem>
 #include <fstream>
