@@ -78,24 +78,25 @@ jobs:
           python tools/verify_pe.py build/network/force-proxy.dll StartForceProxy
           if ($LASTEXITCODE -ne 0) { throw 'force-proxy.dll validation failed' }
 
-      - name: Package sources and Windows DLLs
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build self-contained console EXE
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist/package | Out-Null
-          python tools/package_sources.py _deps/force-proxy dist/package/DVP-Safe-Source.zip
-          if ($LASTEXITCODE -ne 0) { throw 'Source archive failed' }
-          Copy-Item 'build/loader/DWrite.dll' 'dist/package/DWrite.dll'
-          Copy-Item 'build/network/force-proxy.dll' 'dist/package/force-proxy-safe.dll'
-          Copy-Item 'tools/Install-DVPSafe.ps1' 'dist/package/Install-DVPSafe.ps1'
-          Copy-Item 'tools/Disable-DVPSafe.ps1' 'dist/package/Disable-DVPSafe.ps1'
-          Copy-Item 'docs/DVP-SAFE.md' 'dist/package/README.ru.md'
-          Copy-Item 'LICENSE.txt' 'dist/package/LICENSE.txt'
-          Compress-Archive -Path 'dist/package/*' -DestinationPath 'dist/DVP-Safe-Windows-x64.zip' -Force
+          dotnet publish installer-safe/DvpSafeInstaller.csproj --configuration Release --runtime win-x64 --self-contained true --output dist/exe
+          if ($LASTEXITCODE -ne 0) { throw 'DVP-Safe.exe publish failed' }
+          if (!(Test-Path 'dist/exe/DVP-Safe.exe')) { throw 'Missing DVP-Safe.exe' }
+          if ((Get-Item 'dist/exe/DVP-Safe.exe').Length -lt 100000) { throw 'EXE unexpectedly small' }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item 'dist/exe/DVP-Safe.exe' 'dist/DVP-Safe.exe' -Force
 
-      - name: Upload downloadable ZIP
-        uses: actions/upload-artifact@v4
+      - name: Upload single EXE (no ZIP)
+        uses: actions/upload-artifact@v7
         with:
-          name: DVP-Safe-Windows-x64
-          path: dist/DVP-Safe-Windows-x64.zip
+          path: dist/DVP-Safe.exe
+          archive: false
           if-no-files-found: error
           retention-days: 14
