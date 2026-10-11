@@ -8,11 +8,13 @@ namespace DvpSafeInstaller;
 
 internal static class Program
 {
-    private const string MarkerName = ".dvp-safe-install.json";
-    private const string LoaderName = "DWrite.dll";
-    private const string NetworkName = "force-proxy-safe.dll";
-    private const string ConfigName = "proxy.txt";
+    private const string Loader = "DWrite.dll";
+    private const string Network = "force-proxy-safe.dll";
+    private const string Config = "proxy.txt";
+    private const string Marker = ".dvp-safe-install.json";
+    private const string BackupSuffix = ".before-dvp-safe.bak";
 
+    // Формат маркера оставляем прежним: старые установки можно удалить этой версией.
     private sealed record InstallRecord(string LoaderSha256, string NetworkSha256, DateTimeOffset InstalledAt);
 
     private static int Main(string[] args)
@@ -20,315 +22,219 @@ internal static class Program
         Console.OutputEncoding = Encoding.UTF8;
         try
         {
-            if (args.Length == 0) return ShowMenu();
-            var (channel, rest) = ParseChannel(args);
-            if (rest.Length == 0) return ShowMenu(channel);
-            switch (rest[0].ToLowerInvariant())
+            if (!OperatingSystem.IsWindows())
+                throw new PlatformNotSupportedException("Этот EXE предназначен для Windows.");
+
+            if (args.Length > 0)
             {
-                case "install":
+                switch (args[0].ToLowerInvariant())
                 {
-                    var safe = rest.Contains("--safe", StringComparer.OrdinalIgnoreCase);
-                    var positional = rest.Skip(1).Where(x => !x.StartsWith("--", StringComparison.Ordinal)).ToArray();
-                    if (positional.Length > 2) throw new ArgumentException("Формат: install [HOST] [PORT] [--safe]");
-                    var host = positional.Length >= 1 ? positional[0] : Ask("SOCKS5 адрес", "127.0.0.1");
-                    var port = positional.Length >= 2 ? positional[1] : Ask("SOCKS5 порт", "10808");
-                    Install(FindDiscordApp(channel), host, port, safe);
-                    return 0;
+                    case "install":
+                        Install(args.Length > 1 ? args[1] : "127.0.0.1:10808");
+                        return 0;
+                    case "uninstall":
+                        Uninstall();
+                        return 0;
+                    default:
+                        Console.WriteLine("Команды: install [адрес:порт], uninstall");
+                        return 1;
                 }
-                case "uninstall":
-                    Uninstall(FindDiscordApp(channel));
-                    return 0;
-                case "status":
-                    Status(FindDiscordApp(channel));
-                    return 0;
-                case "safe-on":
-                    SetSafeMode(FindDiscordApp(channel), true);
-                    return 0;
-                case "safe-off":
-                    SetSafeMode(FindDiscordApp(channel), false);
-                    return 0;
-                case "logs":
-                    ShowLogs();
-                    return 0;
-                case "help":
-                case "--help":
-                case "-h":
-                    PrintHelp();
+            }
+
+            Console.WriteLine("DVP Safe\n");
+            Console.WriteLine("1. Установить");
+            Console.WriteLine("2. Удалить");
+            Console.WriteLine("0. Выход\n");
+            Console.Write("Выбор: ");
+            switch (Console.ReadLine()?.Trim())
+            {
+                case "1":
+                    Console.Write("SOCKS5 [127.0.0.1:10808]: ");
+                    var address = Console.ReadLine();
+                    Install(string.IsNullOrWhiteSpace(address) ? "127.0.0.1:10808" : address.Trim());
+                    break;
+                case "2":
+                    Uninstall();
+                    break;
+                case "0":
+                case null:
+                case "":
                     return 0;
                 default:
-                    throw new ArgumentException("Неизвестная команда. Используй: DVP-Safe.exe help");
+                    Console.WriteLine("Неверный пункт.");
+                    break;
             }
+            Console.Write("\nEnter — закрыть...");
+            Console.ReadLine();
+            return 0;
         }
-        catch (Exception e)
+        catch (Exception error)
         {
-            Console.Error.WriteLine("Ошибка: " + e.Message);
+            Console.Error.WriteLine("Ошибка: " + error.Message);
+            if (args.Length == 0)
+            {
+                Console.Write("Enter — закрыть...");
+                Console.ReadLine();
+            }
             return 1;
         }
     }
 
-    private static (string channel, string[] args) ParseChannel(string[] args)
+    private static string DiscordDirectory()
     {
-        var output = new List<string>();
-        string channel = "stable";
-        for (int i = 0; i < args.Length; i++)
-        {
-            if (args[i].Equals("--channel", StringComparison.OrdinalIgnoreCase))
-            {
-                if (++i >= args.Length) throw new ArgumentException("Укажи stable, ptb или canary после --channel");
-                channel = args[i].ToLowerInvariant();
-            }
-            else output.Add(args[i]);
-        }
-        if (channel is not ("stable" or "ptb" or "canary")) throw new ArgumentException("Канал должен быть stable, ptb или canary");
-        return (channel, output.ToArray());
+        var root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Discord");
+        if (!Directory.Exists(root))
+            throw new DirectoryNotFoundException("Discord не найден.");
+
+        var latest = Directory.GetDirectories(root, "app-*")
+            .Where(dir => File.Exists(Path.Combine(dir, "Discord.exe")))
+            .OrderByDescending(dir =>
+                Version.TryParse(Path.GetFileName(dir)[4..], out var version)
+                    ? version : new Version(0, 0))
+            .FirstOrDefault();
+        return latest ?? throw new DirectoryNotFoundException("Папка актуальной версии Discord не найдена.");
     }
 
-    private static int ShowMenu(string channel = "stable")
+    private static void CheckDiscordClosed()
     {
-        Console.WriteLine("Discord Voice Proxy Safe — экспериментальный установщик");
-        Console.WriteLine("1 — Установить (с включённым проксированием)");
-        Console.WriteLine("2 — Установить в диагностическом режиме (без сетевых перехватов)");
-        Console.WriteLine("3 — Отключить сетевые перехваты");
-        Console.WriteLine("4 — Включить сетевые перехваты");
-        Console.WriteLine("5 — Проверить состояние");
-        Console.WriteLine("6 — Удалить установленные файлы");
-        Console.WriteLine("7 — Посмотреть лог");
-        Console.Write("Выбор: ");
-        var selection = Console.ReadLine()?.Trim();
-        if (selection is null or "" or "0") return 0;
-        if (selection == "7") { ShowLogs(); return 0; }
-        var app = FindDiscordApp(channel);
-        switch (selection)
-        {
-            case "1":
-            case "2":
-                Install(app, Ask("SOCKS5 адрес", "127.0.0.1"), Ask("SOCKS5 порт", "10808"), selection == "2");
-                break;
-            case "3": SetSafeMode(app, true); break;
-            case "4": SetSafeMode(app, false); break;
-            case "5": Status(app); break;
-            case "6": Uninstall(app); break;
-            default: Console.WriteLine("Неизвестный пункт меню"); break;
-        }
-        return 0;
+        if (new[] { "Discord", "DiscordPTB", "DiscordCanary" }
+            .Any(name => Process.GetProcessesByName(name).Length > 0))
+            throw new InvalidOperationException("Сначала закрой Discord, включая трей.");
     }
 
-    private static string Ask(string caption, string fallback)
+    private static byte[] Embedded(string name)
     {
-        Console.Write($"{caption} [{fallback}]: ");
-        var input = Console.ReadLine()?.Trim();
-        return string.IsNullOrWhiteSpace(input) ? fallback : input;
-    }
-
-    private static string FindDiscordApp(string channel)
-    {
-        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Программа предназначена для Windows x64");
-        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            channel switch { "stable" => "Discord", "ptb" => "DiscordPTB", "canary" => "DiscordCanary", _ => throw new ArgumentException("Канал неизвестен") });
-        if (!Directory.Exists(root)) throw new DirectoryNotFoundException($"Папка Discord не найдена: {root}");
-        var directories = Directory.GetDirectories(root, "app-*")
-            .Where(x => File.Exists(Path.Combine(x, "Discord.exe")))
-            .Select(x => new {
-                Path = x,
-                Version = Version.TryParse(Path.GetFileName(x)[4..], out var version) ? version : new Version(0, 0)
-            })
-            .OrderByDescending(x => x.Version)
-            .ToList();
-        if (directories.Count == 0) throw new DirectoryNotFoundException($"Не найдена рабочая папка app-* с Discord.exe в {root}");
-        return directories[0].Path;
-    }
-
-    private static void CheckDiscordStopped()
-    {
-        foreach (var name in new[] { "Discord", "DiscordPTB", "DiscordCanary" })
-        {
-            if (Process.GetProcessesByName(name).Any())
-                throw new InvalidOperationException("Discord запущен. Полностью закрой его (включая трей) и повтори команду.");
-        }
-    }
-
-    private static byte[] Resource(string name)
-    {
-        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)
-            ?? throw new FileNotFoundException($"Внутри EXE нет ресурса {name}; проверь GitHub Actions.");
+        using var resource = Assembly.GetExecutingAssembly().GetManifestResourceStream(name)
+            ?? throw new FileNotFoundException("В EXE не найдена встроенная DLL: " + name);
         using var buffer = new MemoryStream();
-        stream.CopyTo(buffer);
+        resource.CopyTo(buffer);
         return buffer.ToArray();
     }
 
-    private static string Sha256(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes));
-    private static string Sha256(string filename) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(filename)));
+    private static string Hash(byte[] data) => Convert.ToHexString(SHA256.HashData(data));
+    private static string Hash(string path) => Hash(File.ReadAllBytes(path));
 
-    private static InstallRecord? ReadMarker(string app)
+    private static InstallRecord? ReadRecord(string directory)
     {
-        var file = Path.Combine(app, MarkerName);
-        if (!File.Exists(file)) return null;
-        return JsonSerializer.Deserialize<InstallRecord>(File.ReadAllText(file));
+        var path = Path.Combine(directory, Marker);
+        return File.Exists(path)
+            ? JsonSerializer.Deserialize<InstallRecord>(File.ReadAllText(path))
+            : null;
     }
 
-    private static void WriteAtomically(string path, byte[] contents)
+    private static void EnsureUnmodified(string path, string expectedHash)
     {
-        var temp = path + ".dvp-new-" + Guid.NewGuid().ToString("N");
+        if (File.Exists(path) && !Hash(path).Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(Path.GetFileName(path) + " изменён другим приложением. Операция отменена.");
+    }
+
+    private static void Save(string path, byte[] data)
+    {
+        var temp = path + ".dvp-" + Guid.NewGuid().ToString("N");
         try
         {
-            File.WriteAllBytes(temp, contents);
+            File.WriteAllBytes(temp, data);
             File.Move(temp, path, overwrite: true);
         }
-        finally { if (File.Exists(temp)) File.Delete(temp); }
-    }
-
-    private static void WriteAtomically(string path, string contents)
-        => WriteAtomically(path, new UTF8Encoding(false).GetBytes(contents));
-
-    private static void BackupIfNeeded(string target)
-    {
-        var backup = target + ".before-dvp-safe.bak";
-        if (File.Exists(target) && !File.Exists(backup)) File.Copy(target, backup);
-    }
-
-    private static void Install(string app, string host, string portText, bool safe)
-    {
-        if (string.IsNullOrWhiteSpace(host) || host.Any(c => char.IsControl(c) || c == '='))
-            throw new ArgumentException("Недопустимый SOCKS5 адрес");
-        if (!int.TryParse(portText, out int port) || port is < 1 or > 65535)
-            throw new ArgumentException("Порт должен быть числом от 1 до 65535");
-        CheckDiscordStopped();
-        var loader = Resource("DVP_SAFE_LOADER");
-        var network = Resource("DVP_SAFE_NETWORK");
-        var loaderPath = Path.Combine(app, LoaderName);
-        var networkPath = Path.Combine(app, NetworkName);
-        var configPath = Path.Combine(app, ConfigName);
-        var marker = ReadMarker(app);
-        if (marker is not null)
+        finally
         {
-            if (File.Exists(loaderPath) && !Sha256(loaderPath).Equals(marker.LoaderSha256, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("DWrite.dll изменён после установки. Не заменяю неизвестную DLL.");
-            if (File.Exists(networkPath) && !Sha256(networkPath).Equals(marker.NetworkSha256, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("force-proxy-safe.dll изменён после установки. Не заменяю неизвестную DLL.");
+            if (File.Exists(temp)) File.Delete(temp);
+        }
+    }
+
+    private static void Install(string endpoint)
+    {
+        var separator = endpoint.LastIndexOf(':');
+        if (separator <= 0 || separator == endpoint.Length - 1)
+            throw new ArgumentException("Адрес указывается как 127.0.0.1:10808");
+        var host = endpoint[..separator];
+        if (host.Any(c => char.IsControl(c) || char.IsWhiteSpace(c) || c == '='))
+            throw new ArgumentException("Некорректный адрес SOCKS5.");
+        if (!int.TryParse(endpoint[(separator + 1)..], out int port) || port is < 1 or > 65535)
+            throw new ArgumentException("Некорректный порт SOCKS5.");
+
+        CheckDiscordClosed();
+        var dir = DiscordDirectory();
+        var loaderBytes = Embedded("DVP_SAFE_LOADER");
+        var networkBytes = Embedded("DVP_SAFE_NETWORK");
+        var loader = Path.Combine(dir, Loader);
+        var network = Path.Combine(dir, Network);
+        var config = Path.Combine(dir, Config);
+        var markerPath = Path.Combine(dir, Marker);
+        var prior = ReadRecord(dir);
+
+        if (prior is not null)
+        {
+            EnsureUnmodified(loader, prior.LoaderSha256);
+            EnsureUnmodified(network, prior.NetworkSha256);
         }
         else
         {
-            BackupIfNeeded(loaderPath);
-            BackupIfNeeded(networkPath);
-            BackupIfNeeded(configPath);
+            // Существующие файлы не теряем. Бэкап загрузчика при удалении не запускаем автоматически.
+            foreach (var file in new[] { loader, network, config })
+                if (File.Exists(file) && !File.Exists(file + BackupSuffix))
+                    File.Copy(file, file + BackupSuffix);
         }
-        // Config uses the same options as the patched C++ loader. Never print credentials.
-        var config = $"SOCKS5_PROXY_ADDRESS={host}\nSOCKS5_PROXY_PORT={port}\nDVP_SAFE_MODE={(safe ? "1" : "0")}\n";
-        var markerPath = Path.Combine(app, MarkerName);
-        var targets = new[] { networkPath, configPath, loaderPath, markerPath };
-        var previous = targets.ToDictionary(path => path, path => File.Exists(path) ? File.ReadAllBytes(path) : null);
+
+        var configBytes = new UTF8Encoding(false).GetBytes(
+            $"SOCKS5_PROXY_ADDRESS={host}\nSOCKS5_PROXY_PORT={port}\nDVP_SAFE_MODE=0\n");
+        var metadata = new UTF8Encoding(false).GetBytes(JsonSerializer.Serialize(
+            new InstallRecord(Hash(loaderBytes), Hash(networkBytes), DateTimeOffset.UtcNow)));
+        var files = new[] { (Path: network, Data: networkBytes), (Path: config, Data: configBytes),
+                            (Path: loader, Data: loaderBytes), (Path: markerPath, Data: metadata) };
+
+        // Если запись оборвётся, возвращаем все файлы в прежнее состояние.
+        var old = files.Select(f => File.Exists(f.Path) ? File.ReadAllBytes(f.Path) : null).ToArray();
         try
         {
-            WriteAtomically(networkPath, network);
-            WriteAtomically(configPath, config);
-            WriteAtomically(loaderPath, loader);
-            WriteAtomically(markerPath, JsonSerializer.Serialize(new InstallRecord(Sha256(loader), Sha256(network), DateTimeOffset.UtcNow)));
+            foreach (var file in files) Save(file.Path, file.Data);
         }
         catch
         {
-            Console.Error.WriteLine("Установка прервалась. Пытаюсь вернуть предыдущие файлы.");
-            foreach (var path in targets.Reverse())
+            for (int i = files.Length - 1; i >= 0; i--)
             {
                 try
                 {
-                    if (previous[path] is byte[] original) WriteAtomically(path, original);
-                    else if (File.Exists(path)) File.Delete(path);
+                    if (old[i] is byte[] contents) Save(files[i].Path, contents);
+                    else if (File.Exists(files[i].Path)) File.Delete(files[i].Path);
                 }
-                catch (Exception ex) { Console.Error.WriteLine($"Не удалось восстановить {path}: {ex.Message}"); }
+                catch { /* Ошибка отката не должна скрывать первоначальную ошибку. */ }
             }
             throw;
         }
-        Console.WriteLine($"Готово. Установлено: {app}");
-        Console.WriteLine(safe ? "Диагностический режим: сетевой перехват отключён." : "Сетевой перехват включён (функциональность голоса ещё экспериментальная).");
-        Console.WriteLine("Теперь можно запустить Discord. Для отката: DVP-Safe.exe uninstall");
+        Console.WriteLine("Установлено. Теперь можно открыть Discord.");
     }
 
-    private static void Uninstall(string app)
+    private static void Uninstall()
     {
-        CheckDiscordStopped();
-        var marker = ReadMarker(app);
-        if (marker is null)
+        CheckDiscordClosed();
+        var root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Discord");
+        if (!Directory.Exists(root))
+            throw new DirectoryNotFoundException("Discord не найден.");
+
+        int removed = 0;
+        foreach (var dir in Directory.GetDirectories(root, "app-*"))
         {
-            Console.WriteLine("Установка DVP Safe не обнаружена. Не удаляю неизвестные DLL.");
-            return;
+            var record = ReadRecord(dir);
+            if (record is null) continue;
+            var loader = Path.Combine(dir, Loader);
+            var network = Path.Combine(dir, Network);
+            EnsureUnmodified(loader, record.LoaderSha256);
+            EnsureUnmodified(network, record.NetworkSha256);
+            if (File.Exists(loader)) File.Delete(loader);
+            if (File.Exists(network)) File.Delete(network);
+            var config = Path.Combine(dir, Config);
+            if (File.Exists(config + BackupSuffix))
+                File.Copy(config + BackupSuffix, config, overwrite: true);
+            else if (File.Exists(config))
+            {
+                // Без бэкапа конфигурацию не удаляем: её мог редактировать пользователь.
+            }
+            File.Delete(Path.Combine(dir, Marker));
+            removed++;
         }
-        var loader = Path.Combine(app, LoaderName);
-        var network = Path.Combine(app, NetworkName);
-        if ((File.Exists(loader) && !Sha256(loader).Equals(marker.LoaderSha256, StringComparison.OrdinalIgnoreCase)) ||
-            (File.Exists(network) && !Sha256(network).Equals(marker.NetworkSha256, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException("Один из установленных DLL изменился. Удаление остановлено, чтобы не удалить чужой файл.");
-        DeleteIfSameHash(loader, marker.LoaderSha256);
-        DeleteIfSameHash(network, marker.NetworkSha256);
-        var config = Path.Combine(app, ConfigName);
-        var configBackup = config + ".before-dvp-safe.bak";
-        if (File.Exists(configBackup))
-        {
-            File.Copy(configBackup, config, overwrite: true);
-            Console.WriteLine("Исходный proxy.txt восстановлен из резервной копии.");
-        }
-        else if (File.Exists(config))
-        {
-            Console.WriteLine("proxy.txt оставлен на месте (исходной резервной копии нет).");
-        }
-        File.Delete(Path.Combine(app, MarkerName));
-        Console.WriteLine("DVP Safe отключён. Резервные копии DLL сохранены, старые DLL не восстанавливаются автоматически.");
-    }
-
-    private static void DeleteIfSameHash(string path, string hash)
-    {
-        if (!File.Exists(path)) return;
-        if (Sha256(path).Equals(hash, StringComparison.OrdinalIgnoreCase)) File.Delete(path);
-        else Console.WriteLine($"Не удаляю изменённый файл: {path}");
-    }
-
-    private static void SetSafeMode(string app, bool enabled)
-    {
-        CheckDiscordStopped();
-        if (ReadMarker(app) is null) throw new InvalidOperationException("Сначала установи DVP Safe");
-        var path = Path.Combine(app, ConfigName);
-        if (!File.Exists(path)) throw new FileNotFoundException("Не найден proxy.txt", path);
-        var lines = File.ReadAllLines(path)
-            .Where(x => !x.TrimStart().StartsWith("DVP_SAFE_MODE=", StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        lines.Add("DVP_SAFE_MODE=" + (enabled ? "1" : "0"));
-        WriteAtomically(path, string.Join("\n", lines) + "\n");
-        Console.WriteLine(enabled ? "Диагностический режим включён." : "Сетевой перехват включён. Перезапусти Discord.");
-    }
-
-    private static void Status(string app)
-    {
-        var marker = ReadMarker(app);
-        if (marker is null) { Console.WriteLine("DVP Safe не установлен (маркер отсутствует)."); return; }
-        var loader = Path.Combine(app, LoaderName);
-        var network = Path.Combine(app, NetworkName);
-        Console.WriteLine("Папка: " + app);
-        Console.WriteLine("Loader: " + (File.Exists(loader) && Sha256(loader) == marker.LoaderSha256 ? "OK" : "отсутствует/изменён"));
-        Console.WriteLine("Network: " + (File.Exists(network) && Sha256(network) == marker.NetworkSha256 ? "OK" : "отсутствует/изменён"));
-        var configPath = Path.Combine(app, ConfigName);
-        var safe = File.Exists(configPath) && File.ReadAllLines(configPath).Any(x => x.Trim().Equals("DVP_SAFE_MODE=1", StringComparison.OrdinalIgnoreCase));
-        Console.WriteLine("Режим: " + (safe ? "диагностика (перехваты отключены)" : "проксирование включено"));
-        Console.WriteLine("Установлен: " + marker.InstalledAt.ToLocalTime());
-    }
-
-    private static void ShowLogs()
-    {
-        var file = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DVP-Safe", "loader.log");
-        Console.WriteLine("Лог: " + file);
-        if (!File.Exists(file)) { Console.WriteLine("Лог пока не создан."); return; }
-        foreach (var line in File.ReadLines(file).TakeLast(40)) Console.WriteLine(line);
-    }
-
-    private static void PrintHelp()
-    {
-        Console.WriteLine("Discord Voice Proxy Safe — установщик Windows x64 (экспериментальный)");
-        Console.WriteLine("DVP-Safe.exe                                 интерактивное меню");
-        Console.WriteLine("DVP-Safe.exe install [HOST] [PORT] [--safe] установить");
-        Console.WriteLine("DVP-Safe.exe safe-on                         отключить сетевые перехваты");
-        Console.WriteLine("DVP-Safe.exe safe-off                        включить сетевые перехваты");
-        Console.WriteLine("DVP-Safe.exe status                          проверить установку");
-        Console.WriteLine("DVP-Safe.exe logs                            показать последние 40 строк лога");
-        Console.WriteLine("DVP-Safe.exe uninstall                       удалить только файлы DVP Safe");
-        Console.WriteLine("Дополнительно: --channel stable|ptb|canary (по умолчанию stable)");
-        Console.WriteLine("Исходники: https://github.com/Ishikawa-Tesuto/discord-voice-proxy-safe");
+        Console.WriteLine(removed > 0 ? "Удалено. Discord можно запускать." : "DVP Safe не установлен.");
     }
 }
