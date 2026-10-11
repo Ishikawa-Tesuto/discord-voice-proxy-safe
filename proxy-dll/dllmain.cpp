@@ -1,146 +1,136 @@
-﻿#include <windows.h>
-#include <string>
-#include <fstream>
-#include <sstream>
-#include <iostream>
+// Discord Voice Proxy Safe (experimental patch), 2026-10-11.
+// Derived from https://github.com/runetfreedom/discord-voice-proxy (GPL-3.0).
+// No networking, detours, file IO, or additional DLL loading in DllMain.
+
+#include <windows.h>
+#define DWRITE_EXPORT WINAPI
+#include <dwrite.h>  // Avoid dllimport while defining our DWriteCreateFactory export.
 #include <filesystem>
-#include <detours/detours.h>
-#include "proxy.h"
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <system_error>
 
 namespace fs = std::filesystem;
+namespace {
+HMODULE g_self = nullptr;
+HMODULE g_real_dwrite = nullptr;
+HMODULE g_network_proxy = nullptr;
+INIT_ONCE g_real_once = INIT_ONCE_STATIC_INIT;
+INIT_ONCE g_proxy_once = INIT_ONCE_STATIC_INIT;
 
-extern "C" BOOL(__stdcall * Real_CreateProcessW)(LPCWSTR a0,
-	LPWSTR a1,
-	LPSECURITY_ATTRIBUTES a2,
-	LPSECURITY_ATTRIBUTES a3,
-	BOOL a4,
-	DWORD a5,
-	LPVOID a6,
-	LPCWSTR a7,
-	LPSTARTUPINFOW a8,
-	LPPROCESS_INFORMATION a9) = CreateProcessW;
+using FactoryFn = HRESULT (WINAPI*)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
+FactoryFn g_real_factory = nullptr;
 
-HMODULE OriginalDLL;
-uintptr_t OrignalDWriteCreateFactory;
-uintptr_t OrignalGetFileVersionInfoSizeW;
-uintptr_t OrignalGetFileVersionInfoW;
-uintptr_t OrignalVerQueryValueW;
-
-bool EndsWith(const std::wstring& fullString, const std::wstring& ending)
-{
-	if (ending.size() > fullString.size())
-		return false;
-
-	return fullString.compare(fullString.size() - ending.size(), ending.size(), ending) == 0;
+fs::path SelfDirectory() {
+    wchar_t module_path[32768] = {};
+    DWORD length = GetModuleFileNameW(g_self, module_path, static_cast<DWORD>(std::size(module_path)));
+    if (!length || length >= std::size(module_path)) return {};
+    return fs::path(std::wstring(module_path, length)).parent_path();
 }
 
-BOOL __stdcall Mine_CreateProcessW(LPCWSTR lpApplicationName,
-	LPWSTR lpCommandLine,
-	LPSECURITY_ATTRIBUTES lpProcessAttributes,
-	LPSECURITY_ATTRIBUTES lpThreadAttributes,
-	BOOL bInheritHandles,
-	DWORD dwCreationFlags,
-	LPVOID lpEnvironment,
-	LPCWSTR lpCurrentDirectory,
-	LPSTARTUPINFOW lpStartupInfo,
-	LPPROCESS_INFORMATION lpProcessInformation)
-{
-	;
-	WCHAR path[MAX_PATH];
-	GetModuleFileNameW(NULL, path, MAX_PATH);
-
-	std::vector<std::wstring> files = {
-		L"proxy.txt",
-		L"force-proxy.dll",
-		L"DWrite.dll"
-	};
-
-	if (lpApplicationName != NULL) {
-		auto targetAppName = std::wstring(lpApplicationName);
-		auto currentPath = std::wstring(path);
-
-		if (EndsWith(targetAppName, L"Discord.exe") && targetAppName != currentPath) {
-			auto currentDir = fs::path(currentPath).parent_path();
-			auto targetDir = fs::path(targetAppName).parent_path();
-
-			for (const auto& file : files) {
-				if (fs::exists(currentDir.wstring() + L"\\" + file)) {
-					fs::copy(currentDir.wstring() + L"\\" + file, targetDir.wstring() + L"\\" + file, fs::copy_options::overwrite_existing);
-				}
-			}
-		}
-	}
-
-	return Real_CreateProcessW(lpApplicationName,
-		lpCommandLine,
-		lpProcessAttributes,
-		lpThreadAttributes,
-		bInheritHandles,
-		dwCreationFlags,
-		lpEnvironment,
-		lpCurrentDirectory,
-		lpStartupInfo,
-		lpProcessInformation);
+void Log(const char* message, DWORD code = ERROR_SUCCESS) noexcept {
+    try {
+        wchar_t app_data[32768] = {};
+        DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", app_data, static_cast<DWORD>(std::size(app_data)));
+        if (!length || length >= std::size(app_data)) return;
+        fs::path folder = fs::path(std::wstring(app_data, length)) / L"DVP-Safe";
+        std::error_code ec;
+        fs::create_directories(folder, ec);
+        if (ec) return;
+        std::ofstream file(folder / L"loader.log", std::ios::app);
+        if (!file) return;
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+        file << now.wYear << '-' << now.wMonth << '-' << now.wDay << ' '
+             << now.wHour << ':' << now.wMinute << ':' << now.wSecond
+             << " [" << GetCurrentProcessId() << "] " << message;
+        if (code) file << " (Win32=" << code << ')';
+        file << '\n';
+    } catch (...) {
+        // Diagnostic logging is never allowed to break Discord.
+    }
 }
 
-void LoadForceProxy()
-{
-	std::ifstream file("proxy.txt");
-	std::string line;
-
-	while (file.is_open() && getline(file, line)) {
-		std::stringstream ss(line);
-
-		std::string key, value;
-		if (getline(ss, key, '=') && getline(ss, value)) {
-			SetEnvironmentVariableA(key.c_str(), value.c_str());
-		}
-	}
-
-	if (LoadLibraryA("force-proxy.dll") == NULL) {
-		char text[MAX_PATH];
-		_snprintf_s(text, sizeof(text), "Cannot load force-proxy.dll. Error code: %d", GetLastError());
-		MessageBoxA(0, text, "Proxy", MB_ICONERROR);
-	}
+BOOL CALLBACK InitRealDWrite(PINIT_ONCE, PVOID, PVOID*) {
+    g_real_dwrite = LoadLibraryExW(L"DWrite.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!g_real_dwrite) {
+        Log("system DWrite.dll could not be loaded", GetLastError());
+        return TRUE; // Cache failure and fail the factory call gracefully.
+    }
+    g_real_factory = reinterpret_cast<FactoryFn>(GetProcAddress(g_real_dwrite, "DWriteCreateFactory"));
+    if (!g_real_factory) Log("DWriteCreateFactory export missing", GetLastError());
+    return TRUE;
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-	char path[MAX_PATH];
-	switch (ul_reason_for_call)
-	{
-	case DLL_PROCESS_ATTACH:
-	{
-		DisableThreadLibraryCalls(hModule);
-		CopyMemory(path + GetSystemDirectoryA(path, MAX_PATH - 12), "\\DWrite.dll", 13);
-		OriginalDLL = LoadLibraryA(path);
-		if (OriginalDLL == NULL)
-		{
-			MessageBoxA(0, "Cannot load original version.dll", "Proxy", MB_ICONERROR);
-			MessageBoxA(0, path, "Proxy", MB_ICONERROR);
-			ExitProcess(0);
-		}
-		OrignalDWriteCreateFactory = (uintptr_t)GetProcAddress(OriginalDLL, "DWriteCreateFactory");
+std::string Trim(std::string s) {
+    const auto a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return {};
+    const auto b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
 
-		LoadForceProxy();
-		DetourRestoreAfterWith();
-		DetourTransactionBegin();
-		DetourUpdateThread(GetCurrentThread());
-		DetourAttach((PVOID *)(&Real_CreateProcessW), Mine_CreateProcessW);
-		DetourTransactionCommit();
+bool AllowedSetting(const std::string& key) {
+    return key == "SOCKS5_PROXY_ADDRESS" || key == "SOCKS5_PROXY_PORT" ||
+           key == "SOCKS5_PROXY_TIMEOUT" || key == "SOCKS5_PROXY_LOGIN" ||
+           key == "SOCKS5_PROXY_PASSWORD" || key == "DVP_SAFE_MODE";
+}
 
-		break;
-	}
-	case DLL_PROCESS_DETACH:
-	{
-		DetourTransactionBegin();
-		DetourUpdateThread(GetCurrentThread());
-		DetourDetach((PVOID*)(&Real_CreateProcessW), Mine_CreateProcessW);
-		DetourTransactionCommit();
+BOOL CALLBACK InitNetworkProxy(PINIT_ONCE, PVOID, PVOID*) {
+    try {
+        const auto directory = SelfDirectory();
+        if (directory.empty()) { Log("could not determine DLL directory"); return TRUE; }
+        std::ifstream config(directory / L"proxy.txt");
+        if (!config) { Log("proxy.txt missing: proxy disabled"); return TRUE; }
 
-		FreeLibrary(OriginalDLL);
+        std::string line;
+        while (std::getline(config, line)) {
+            const auto pos = line.find('=');
+            if (pos == std::string::npos) continue;
+            const std::string key = Trim(line.substr(0, pos));
+            const std::string value = Trim(line.substr(pos + 1));
+            if (AllowedSetting(key)) SetEnvironmentVariableA(key.c_str(), value.c_str());
+        }
 
-		break;
-	}
-	}
-	return TRUE;
+        char disabled[8] = {};
+        if (GetEnvironmentVariableA("DVP_SAFE_MODE", disabled, sizeof(disabled)) &&
+            std::string(disabled) == "1") {
+            Log("safe mode: network proxy not loaded");
+            return TRUE;
+        }
+
+        // IMPORTANT: Only the rebuilt, explicitly initialized component is loaded.
+        // Never auto-load the legacy force-proxy.dll: its DllMain installs hooks.
+        const fs::path dll = directory / L"force-proxy-safe.dll";
+        if (!fs::exists(dll)) { Log("force-proxy-safe.dll missing: proxy disabled"); return TRUE; }
+        g_network_proxy = LoadLibraryW(dll.c_str());
+        if (!g_network_proxy) { Log("cannot load force-proxy-safe.dll", GetLastError()); return TRUE; }
+
+        using StartFn = BOOL (WINAPI*)();
+        const auto start = reinterpret_cast<StartFn>(GetProcAddress(g_network_proxy, "StartForceProxy"));
+        if (!start) { Log("StartForceProxy export missing: proxy disabled", GetLastError()); return TRUE; }
+        if (!start()) Log("StartForceProxy initialization returned false");
+        else Log("StartForceProxy invoked; network hook status is not independently verified");
+    } catch (...) {
+        Log("unexpected C++ exception during proxy initialization");
+    }
+    return TRUE;
+}
+} // namespace
+
+// Export real DWrite ABI directly, instead of the original raw assembly JMP.
+extern "C" __declspec(dllexport)
+HRESULT WINAPI DWriteCreateFactory(DWRITE_FACTORY_TYPE type, REFIID iid, IUnknown** factory) {
+    InitOnceExecuteOnce(&g_real_once, InitRealDWrite, nullptr, nullptr);
+    if (!g_real_factory) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
+    InitOnceExecuteOnce(&g_proxy_once, InitNetworkProxy, nullptr, nullptr);
+    return g_real_factory(type, iid, factory);
+}
+
+BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_self = self;
+        DisableThreadLibraryCalls(self);
+    }
+    return TRUE;
 }
